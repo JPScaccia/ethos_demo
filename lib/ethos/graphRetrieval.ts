@@ -4,6 +4,10 @@ import { db } from "../db";
 import { ethosConfig } from "../config";
 
 import type {
+  EthosIntent
+} from "../types";
+
+import type {
   SemanticAnchor
 } from "./semanticRetrieval";
 
@@ -11,671 +15,913 @@ import type {
 /* ============================================================
    ETHOS GRAPH RETRIEVAL
 
-   Expands the semantic anchors across the frozen Ethos
-   knowledge graph.
+   Port of the validated R graph logic used by v2.7a.
 
-   Semantic anchors
-        ↓
-   outgoing + incoming edges
-        ↓
-   neighboring nodes
-        ↓
-   graph candidate features
+   This file reproduces:
+
+   - get_two_hop_paths()
+   - get_node_authority()
+   - rank_graph_results()
+   - add_intent_scores()
+   - retrieve_by_intent()
+   - retrieve_from_anchors()
 
    IMPORTANT:
-   This file performs GRAPH EXPANSION.
-
-   It deliberately does NOT invent the final v2.7a graph or
-   hybrid scoring formula.
-
-   Those calculations belong in hybridRetrieval.ts and should
-   be ported directly from the validated R implementation.
+   Final cross-candidate hybrid ranking still belongs in
+   hybridRetrieval.ts.
    ============================================================ */
 
 
 /* ============================================================
-   INPUT
+   TYPES
    ============================================================ */
 
 export interface GraphRetrievalInput {
   anchors: SemanticAnchor[];
 
-  grade?: number;
-
-  month?: string | null;
+  intent: EthosIntent;
 
   nPerAnchor?: number;
 }
 
 
-/* ============================================================
-   RELATIONSHIP DIRECTION
-   ============================================================ */
+export interface GraphResult {
+  candidate: string;
 
-export type GraphDirection =
-  | "outgoing"
-  | "incoming";
+  direct_strength: number;
 
+  direct_paths: number;
 
-/* ============================================================
-   ONE ANCHOR → CANDIDATE CONTRIBUTION
-   ============================================================ */
+  two_hop_paths: number;
 
-export interface GraphContribution {
-  anchor_node_id: string;
+  strongest_two_hop: number;
 
-  anchor_title: string;
+  mean_two_hop: number;
+
+  authority_score: number;
+
+  path_bonus: number;
+
+  score: number;
+
+  intent_score: number;
+
+  final_score: number;
+
+  anchor_node: string;
 
   anchor_rank: number;
 
-  anchor_semantic_similarity: number;
+  anchor_semantic_score: number;
+}
 
-  candidate_node_id: string;
 
-  candidate_title: string;
-
-  candidate_node_type: string;
-
-  edge_id: string;
-
-  relationship_type: string;
-
-  direction: GraphDirection;
-
+interface EdgeRecord {
+  from_node: string;
+  to_node: string;
   alignment_strength: number;
-
-  edge_grade: number | null;
-
-  edge_month: string | null;
-
-  rationale: string | null;
-
-  assertion_authority: string | null;
 }
 
 
-/* ============================================================
-   AGGREGATED GRAPH CANDIDATE
-   ============================================================ */
-
-export interface GraphCandidate {
-  candidate: string;
-
-  title: string;
-
+interface NodeMeta {
+  node_id: string;
   node_type: string;
+  instructional_use: string[];
+  authority_level: string | null;
+}
 
-  anchor_hits: number;
 
-  best_anchor_rank: number;
-
-  max_alignment_strength: number;
-
-  mean_alignment_strength: number;
-
-  max_anchor_semantic: number;
-
-  primary_anchor_graph: string;
-
-  primary_relationship_role: string;
-
-  contributions: GraphContribution[];
+interface CandidateAccumulator {
+  directStrengths: number[];
+  directPaths: number;
+  twoHopStrengths: number[];
 }
 
 
 /* ============================================================
-   NORMALIZE N PER ANCHOR
+   CONFIG
    ============================================================ */
 
-function normalizeNPerAnchor(
-  value?: number
+const MIN_STRENGTH = 1;
+
+
+/* ============================================================
+   AUTHORITY SCORE
+
+   Exact port of get_node_authority()
+   ============================================================ */
+
+function scoreAuthority(
+  authorityLevel: string | null
 ): number {
 
-  const n =
-    value ??
-    ethosConfig.graphResultsPerAnchor;
+  switch (authorityLevel) {
+
+    case "A1_BIBLICAL":
+      return 1;
+
+    case "A2_MAGISTERIAL":
+      return 0.9;
+
+    case "A3_ECCLESIAL_STANDARD":
+      return 0.8;
+
+    case "A4_VETTED_REFERENCE":
+      return 0.65;
+
+    case "A5_LOCAL_RESOURCE":
+      return 0.5;
+
+    case "A6_AI_GENERATED":
+      return 0.25;
+
+    default:
+      return 0;
+  }
+}
+
+
+/* ============================================================
+   INTENT SCORE
+
+   Exact port of score_intent_match()
+   ============================================================ */
+
+function scoreIntentMatch(
+  intent: EthosIntent,
+  nodeType: string,
+  instructionalUse: string[]
+): number {
+
+  const uses =
+    instructionalUse ?? [];
 
 
   if (
-    !Number.isInteger(n) ||
-    n < 1
+    intent === "saint" &&
+    nodeType === "saint"
   ) {
-    throw new Error(
-      "graphResultsPerAnchor must be a positive integer."
-    );
+    return 1;
   }
 
-
-  return n;
-}
-
-
-/* ============================================================
-   GRADE MATCHING
-
-   Edge.grade is nullable.
-
-   A null grade means the relationship is not restricted to
-   one specific grade.
-   ============================================================ */
-
-function matchesGrade(
-  edgeGrade: number | null,
-  requestedGrade?: number
-): boolean {
 
   if (
-    requestedGrade === undefined
+    intent === "saint" &&
+    uses.includes("SAINT_STUDY")
   ) {
-    return true;
+    return 0.6;
   }
 
 
-  return (
-    edgeGrade === null ||
-    edgeGrade === requestedGrade
-  );
+  if (
+    intent === "scripture" &&
+    nodeType === "scripture"
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "scripture" &&
+    uses.includes("SCRIPTURE_STUDY")
+  ) {
+    return 0.5;
+  }
+
+
+  if (
+    intent === "virtue" &&
+    nodeType === "virtue"
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "virtue" &&
+    uses.includes("VIRTUE_FORMATION")
+  ) {
+    return 0.5;
+  }
+
+
+  if (
+    intent === "standards" &&
+    nodeType === "catholic_standard"
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "activity" &&
+    uses.includes("ACTIVITY")
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "activity" &&
+    uses.includes("SIMULATION")
+  ) {
+    return 0.8;
+  }
+
+
+  if (
+    intent === "discussion" &&
+    nodeType === "essential_question" &&
+    uses.includes("SOCRATIC_DISCUSSION")
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "discussion" &&
+    uses.includes("SOCRATIC_DISCUSSION")
+  ) {
+    return 0.5;
+  }
+
+
+  if (
+    intent === "family" &&
+    (
+      nodeType === "essential_question" ||
+      nodeType === "instructional_resource"
+    ) &&
+    uses.includes("FAMILY_DISCUSSION")
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "family" &&
+    uses.includes("FAMILY_DISCUSSION")
+  ) {
+    return 0.4;
+  }
+
+
+  if (
+    intent === "primary_source" &&
+    uses.includes("PRIMARY_SOURCE")
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "teacher_reading" &&
+    uses.includes("TEACHER_READING")
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "doctrine" &&
+    (
+      nodeType === "church_document" ||
+      nodeType === "catechism_teaching"
+    )
+  ) {
+    return 1;
+  }
+
+
+  if (
+    intent === "doctrine" &&
+    nodeType === "catholic_concept"
+  ) {
+    return 0.8;
+  }
+
+
+  if (
+    intent === "doctrine" &&
+    uses.includes("DOCTRINAL_INSTRUCTION")
+  ) {
+    return 0.5;
+  }
+
+
+  return 0;
 }
 
 
 /* ============================================================
-   MONTH MATCHING
-
-   We do NOT hard-filter null month relationships.
-
-   A null edge month represents a relationship that is not
-   limited to a specific instructional month.
+   FETCH GRAPH DATA
    ============================================================ */
 
-function matchesMonth(
-  edgeMonth: string | null,
-  requestedMonth?: string | null
-): boolean {
-
-  if (!requestedMonth) {
-    return true;
-  }
-
-
-  if (!edgeMonth) {
-    return true;
-  }
-
-
-  return (
-    edgeMonth.toLowerCase() ===
-    requestedMonth.toLowerCase()
-  );
-}
-
-
-/* ============================================================
-   EXPAND ONE ANCHOR
-   ============================================================ */
-
-async function expandAnchor(
-  anchor: SemanticAnchor,
-  grade: number | undefined,
-  month: string | null | undefined,
-  nPerAnchor: number
-): Promise<GraphContribution[]> {
-
-  /*
-   * Fetch both directions.
-   *
-   * Example:
-   *
-   * TOPIC_INDUSTRIALIZATION
-   *     --RESPONDS_TO-->
-   * DOC_RERUM_NOVARUM
-   *
-   * We also want to discover useful relationships when the
-   * semantic anchor happens to be on the "to" side of an edge.
-   */
+async function loadGraphData(): Promise<{
+  edges: EdgeRecord[];
+  nodes: Map<string, NodeMeta>;
+}> {
 
   const [
-    outgoing,
-    incoming
+    edges,
+    nodes
   ] = await Promise.all([
 
     db.edge.findMany({
       where: {
-        from_node:
-          anchor.node_id
+        alignment_strength: {
+          gte: MIN_STRENGTH
+        }
       },
 
-      include: {
-        to: true
+      select: {
+        from_node: true,
+        to_node: true,
+        alignment_strength: true
       }
     }),
 
-    db.edge.findMany({
-      where: {
-        to_node:
-          anchor.node_id
-      },
-
-      include: {
-        from: true
+    db.node.findMany({
+      select: {
+        node_id: true,
+        node_type: true,
+        instructional_use: true,
+        authority_level: true
       }
     })
   ]);
 
 
-  /* ----------------------------------------------------------
-     OUTGOING CONTRIBUTIONS
-     ---------------------------------------------------------- */
-
-  const outgoingContributions:
-    GraphContribution[] =
-    outgoing
-      .filter(
-        edge =>
-          matchesGrade(
-            edge.grade,
-            grade
-          ) &&
-          matchesMonth(
-            edge.month,
-            month
-          )
-      )
-      .map(
-        edge => ({
-          anchor_node_id:
-            anchor.node_id,
-
-          anchor_title:
-            anchor.title,
-
-          anchor_rank:
-            anchor.semantic_rank,
-
-          anchor_semantic_similarity:
-            anchor.similarity,
-
-          candidate_node_id:
-            edge.to.node_id,
-
-          candidate_title:
-            edge.to.title,
-
-          candidate_node_type:
-            edge.to.node_type,
-
-          edge_id:
-            edge.edge_id,
-
-          relationship_type:
-            edge.relationship_type,
-
-          direction:
-            "outgoing" as const,
-
-          alignment_strength:
-            edge.alignment_strength,
-
-          edge_grade:
-            edge.grade,
-
-          edge_month:
-            edge.month,
-
-          rationale:
-            edge.rationale,
-
-          assertion_authority:
-            edge.assertion_authority
-        })
-      );
+  const nodeMap =
+    new Map<string, NodeMeta>();
 
 
-  /* ----------------------------------------------------------
-     INCOMING CONTRIBUTIONS
-     ---------------------------------------------------------- */
+  for (const node of nodes) {
 
-  const incomingContributions:
-    GraphContribution[] =
-    incoming
-      .filter(
-        edge =>
-          matchesGrade(
-            edge.grade,
-            grade
-          ) &&
-          matchesMonth(
-            edge.month,
-            month
-          )
-      )
-      .map(
-        edge => ({
-          anchor_node_id:
-            anchor.node_id,
+    nodeMap.set(
+      node.node_id,
+      {
+        node_id:
+          node.node_id,
 
-          anchor_title:
-            anchor.title,
+        node_type:
+          node.node_type,
 
-          anchor_rank:
-            anchor.semantic_rank,
+        instructional_use:
+          node.instructional_use,
 
-          anchor_semantic_similarity:
-            anchor.similarity,
-
-          candidate_node_id:
-            edge.from.node_id,
-
-          candidate_title:
-            edge.from.title,
-
-          candidate_node_type:
-            edge.from.node_type,
-
-          edge_id:
-            edge.edge_id,
-
-          relationship_type:
-            edge.relationship_type,
-
-          direction:
-            "incoming" as const,
-
-          alignment_strength:
-            edge.alignment_strength,
-
-          edge_grade:
-            edge.grade,
-
-          edge_month:
-            edge.month,
-
-          rationale:
-            edge.rationale,
-
-          assertion_authority:
-            edge.assertion_authority
-        })
-      );
-
-
-  /* ----------------------------------------------------------
-     COMBINE + PRIORITIZE
-
-     This is NOT the final graph score.
-
-     We simply use existing graph metadata to limit expansion
-     to nPerAnchor candidates.
-
-     Stronger explicitly curated alignments come first.
-     Semantic anchor similarity is used only as a stable
-     secondary ordering feature.
-     ---------------------------------------------------------- */
-
-  return [
-    ...outgoingContributions,
-    ...incomingContributions
-  ]
-    .filter(
-      contribution =>
-        contribution.candidate_node_id !==
-        anchor.node_id
-    )
-    .sort(
-      (a, b) => {
-
-        if (
-          b.alignment_strength !==
-          a.alignment_strength
-        ) {
-          return (
-            b.alignment_strength -
-            a.alignment_strength
-          );
-        }
-
-
-        return (
-          b.anchor_semantic_similarity -
-          a.anchor_semantic_similarity
-        );
+        authority_level:
+          node.authority_level
       }
-    )
-    .slice(
-      0,
-      nPerAnchor
     );
+  }
+
+
+  return {
+    edges,
+    nodes: nodeMap
+  };
 }
 
 
 /* ============================================================
-   AGGREGATE CONTRIBUTIONS
+   GRAPH ADJACENCY
 
-   One candidate can be reached from several semantic anchors.
+   The R implementation makes the graph bidirectional:
 
-   That information is important to v2.7a.
+   bind_rows(
+     from_node -> to_node,
+     to_node   -> from_node
+   )
 
-   For example:
-
-   anchor_hits
-   best_anchor_rank
-   max_anchor_semantic
-   primary_anchor_graph
-
-   are all preserved here.
+   We reproduce that exactly.
    ============================================================ */
 
-function aggregateContributions(
-  contributions: GraphContribution[]
-): GraphCandidate[] {
+function buildAdjacency(
+  edges: EdgeRecord[]
+): Map<
+  string,
+  Array<{
+    to: string;
+    strength: number;
+  }>
+> {
 
-  const grouped =
+  const adjacency =
     new Map<
       string,
-      GraphContribution[]
+      Array<{
+        to: string;
+        strength: number;
+      }>
     >();
 
 
-  for (
-    const contribution of contributions
-  ) {
+  function addEdge(
+    from: string,
+    to: string,
+    strength: number
+  ): void {
 
     const existing =
-      grouped.get(
-        contribution.candidate_node_id
-      );
-
+      adjacency.get(from);
 
     if (existing) {
 
-      existing.push(
-        contribution
-      );
+      existing.push({
+        to,
+        strength
+      });
 
     } else {
 
-      grouped.set(
-        contribution.candidate_node_id,
-        [contribution]
+      adjacency.set(
+        from,
+        [{
+          to,
+          strength
+        }]
       );
     }
   }
 
 
-  const candidates:
-    GraphCandidate[] = [];
+  for (const edge of edges) {
+
+    addEdge(
+      edge.from_node,
+      edge.to_node,
+      edge.alignment_strength
+    );
+
+    addEdge(
+      edge.to_node,
+      edge.from_node,
+      edge.alignment_strength
+    );
+  }
+
+
+  return adjacency;
+}
+
+
+/* ============================================================
+   RANK GRAPH RESULTS
+
+   Exact formula from rank_graph_results():
+
+   score =
+       direct_strength    * .45
+     + strongest_two_hop  * .20
+     + mean_two_hop       * .10
+     + authority_score    * .15
+     + path_bonus         * .10
+
+   where:
+
+   direct_strength =
+     max(alignment_strength) / 3
+
+   two-hop path strength =
+     (strength1 / 3) * (strength2 / 3)
+
+   path_bonus =
+     min((direct_paths + two_hop_paths) / 5, 1)
+   ============================================================ */
+
+function rankGraphResults(
+  nodeId: string,
+  adjacency: Map<
+    string,
+    Array<{
+      to: string;
+      strength: number;
+    }>
+  >,
+  nodeMap: Map<string, NodeMeta>
+): Omit<
+  GraphResult,
+  | "intent_score"
+  | "final_score"
+  | "anchor_node"
+  | "anchor_rank"
+  | "anchor_semantic_score"
+>[] {
+
+  const candidates =
+    new Map<
+      string,
+      CandidateAccumulator
+    >();
+
+
+  function getCandidate(
+    candidateId: string
+  ): CandidateAccumulator {
+
+    const existing =
+      candidates.get(
+        candidateId
+      );
+
+
+    if (existing) {
+      return existing;
+    }
+
+
+    const created:
+      CandidateAccumulator = {
+
+      directStrengths: [],
+
+      directPaths: 0,
+
+      twoHopStrengths: []
+    };
+
+
+    candidates.set(
+      candidateId,
+      created
+    );
+
+
+    return created;
+  }
+
+
+  /* ----------------------------------------------------------
+     DIRECT PATHS
+     ---------------------------------------------------------- */
+
+  const directEdges =
+    adjacency.get(nodeId) ?? [];
+
+
+  for (
+    const edge of directEdges
+  ) {
+
+    const candidate =
+      getCandidate(
+        edge.to
+      );
+
+
+    candidate.directStrengths.push(
+      edge.strength
+    );
+
+    candidate.directPaths += 1;
+  }
+
+
+  /* ----------------------------------------------------------
+     TWO-HOP PATHS
+
+     Exact R behavior:
+     - graph is bidirectional
+     - many-to-many paths are preserved
+     - hop2 == starting node is removed
+     - hop1 and hop2 may otherwise repeat through different
+       graph paths
+     ---------------------------------------------------------- */
+
+  for (
+    const firstHop of directEdges
+  ) {
+
+    const secondEdges =
+      adjacency.get(
+        firstHop.to
+      ) ?? [];
+
+
+    for (
+      const secondHop of secondEdges
+    ) {
+
+      if (
+        secondHop.to === nodeId
+      ) {
+        continue;
+      }
+
+
+      const pathStrength =
+        (
+          firstHop.strength / 3
+        ) *
+        (
+          secondHop.strength / 3
+        );
+
+
+      const candidate =
+        getCandidate(
+          secondHop.to
+        );
+
+
+      candidate
+        .twoHopStrengths
+        .push(
+          pathStrength
+        );
+    }
+  }
+
+
+  /* ----------------------------------------------------------
+     CALCULATE SCORES
+     ---------------------------------------------------------- */
+
+  const results:
+    Omit<
+      GraphResult,
+      | "intent_score"
+      | "final_score"
+      | "anchor_node"
+      | "anchor_rank"
+      | "anchor_semantic_score"
+    >[] = [];
 
 
   for (
     const [
       candidateId,
-      candidateContributions
-    ] of grouped.entries()
+      data
+    ] of candidates.entries()
   ) {
 
-    const first =
-      candidateContributions[0];
+    if (
+      candidateId === nodeId
+    ) {
+      continue;
+    }
 
 
-    /* --------------------------------------------------------
-       DISTINCT ANCHOR HITS
-       -------------------------------------------------------- */
+    const directStrength =
+      data.directStrengths.length > 0
+        ? Math.max(
+            ...data.directStrengths
+          ) / 3
+        : 0;
 
-    const uniqueAnchors =
-      new Set(
-        candidateContributions.map(
-          item =>
-            item.anchor_node_id
-        )
+
+    const directPaths =
+      data.directPaths;
+
+
+    const twoHopPaths =
+      data.twoHopStrengths.length;
+
+
+    const strongestTwoHop =
+      twoHopPaths > 0
+        ? Math.max(
+            ...data.twoHopStrengths
+          )
+        : 0;
+
+
+    const meanTwoHop =
+      twoHopPaths > 0
+        ? data.twoHopStrengths
+            .reduce(
+              (
+                total,
+                value
+              ) =>
+                total + value,
+              0
+            ) /
+          twoHopPaths
+        : 0;
+
+
+    const node =
+      nodeMap.get(
+        candidateId
       );
 
 
-    /* --------------------------------------------------------
-       BEST ANCHOR RANK
-       -------------------------------------------------------- */
+    const authorityScore =
+      scoreAuthority(
+        node?.authority_level ??
+        null
+      );
 
-    const bestAnchorRank =
+
+    const pathBonus =
       Math.min(
-        ...candidateContributions.map(
-          item =>
-            item.anchor_rank
-        )
-      );
-
-
-    /* --------------------------------------------------------
-       ALIGNMENT STRENGTH
-       -------------------------------------------------------- */
-
-    const strengths =
-      candidateContributions.map(
-        item =>
-          item.alignment_strength
-      );
-
-
-    const maxAlignmentStrength =
-      Math.max(
-        ...strengths
-      );
-
-
-    const meanAlignmentStrength =
-      strengths.reduce(
         (
-          total,
-          value
-        ) =>
-          total + value,
-        0
-      ) /
-      strengths.length;
-
-
-    /* --------------------------------------------------------
-       MAX ANCHOR SEMANTIC
-       -------------------------------------------------------- */
-
-    const maxAnchorSemantic =
-      Math.max(
-        ...candidateContributions.map(
-          item =>
-            item.anchor_semantic_similarity
-        )
+          directPaths +
+          twoHopPaths
+        ) / 5,
+        1
       );
 
 
-    /* --------------------------------------------------------
-       PRIMARY CONTRIBUTION
-
-       This is only identifying the strongest available graph
-       relationship for descriptive purposes.
-
-       It is NOT the final v2.7a graph score.
-       -------------------------------------------------------- */
-
-    const primary =
-      [...candidateContributions]
-        .sort(
-          (a, b) => {
-
-            if (
-              b.alignment_strength !==
-              a.alignment_strength
-            ) {
-              return (
-                b.alignment_strength -
-                a.alignment_strength
-              );
-            }
+    const score =
+      directStrength * 0.45 +
+      strongestTwoHop * 0.20 +
+      meanTwoHop * 0.10 +
+      authorityScore * 0.15 +
+      pathBonus * 0.10;
 
 
-            if (
-              a.anchor_rank !==
-              b.anchor_rank
-            ) {
-              return (
-                a.anchor_rank -
-                b.anchor_rank
-              );
-            }
-
-
-            return (
-              b.anchor_semantic_similarity -
-              a.anchor_semantic_similarity
-            );
-          }
-        )[0];
-
-
-    candidates.push({
+    results.push({
       candidate:
         candidateId,
 
-      title:
-        first.candidate_title,
+      direct_strength:
+        directStrength,
 
-      node_type:
-        first.candidate_node_type,
+      direct_paths:
+        directPaths,
 
-      anchor_hits:
-        uniqueAnchors.size,
+      two_hop_paths:
+        twoHopPaths,
 
-      best_anchor_rank:
-        bestAnchorRank,
+      strongest_two_hop:
+        strongestTwoHop,
 
-      max_alignment_strength:
-        maxAlignmentStrength,
+      mean_two_hop:
+        meanTwoHop,
 
-      mean_alignment_strength:
-        meanAlignmentStrength,
+      authority_score:
+        authorityScore,
 
-      max_anchor_semantic:
-        maxAnchorSemantic,
+      path_bonus:
+        pathBonus,
 
-      primary_anchor_graph:
-        primary.anchor_node_id,
-
-      primary_relationship_role:
-        primary.relationship_type,
-
-      contributions:
-        candidateContributions
+      score
     });
   }
 
 
-  return candidates;
+  return results.sort(
+    (a, b) =>
+      b.score - a.score
+  );
 }
 
 
 /* ============================================================
-   GRAPH RETRIEVAL
+   RETRIEVE BY INTENT
+
+   Exact port of retrieve_by_intent():
+
+   final_score = score + intent_score * .2
+
+   IMPORTANT:
+   R calculates final_score but does NOT use it downstream as
+   the graph score. We preserve it for parity/debugging only.
    ============================================================ */
 
-export async function retrieveGraph(
+function retrieveByIntent(
+  nodeId: string,
+  intent: EthosIntent,
+  n: number,
+  adjacency: Map<
+    string,
+    Array<{
+      to: string;
+      strength: number;
+    }>
+  >,
+  nodeMap: Map<string, NodeMeta>
+): Omit<
+  GraphResult,
+  | "anchor_node"
+  | "anchor_rank"
+  | "anchor_semantic_score"
+>[] {
+
+  const results =
+    rankGraphResults(
+      nodeId,
+      adjacency,
+      nodeMap
+    );
+
+
+  if (
+    results.length === 0
+  ) {
+    return [];
+  }
+
+
+  const scored =
+    results.map(
+      result => {
+
+        const node =
+          nodeMap.get(
+            result.candidate
+          );
+
+
+        const intentScore =
+          scoreIntentMatch(
+            intent,
+            node?.node_type ?? "",
+            node?.instructional_use ?? []
+          );
+
+
+        return {
+          ...result,
+
+          intent_score:
+            intentScore,
+
+          final_score:
+            result.score +
+            intentScore * 0.2
+        };
+      }
+    );
+
+
+  if (
+    intent === "general"
+  ) {
+
+    return scored
+      .sort(
+        (a, b) =>
+          b.score - a.score
+      )
+      .slice(
+        0,
+        n
+      );
+  }
+
+
+  return scored
+    .sort(
+      (a, b) => {
+
+        const aMatch =
+          a.intent_score > 0
+            ? 1
+            : 0;
+
+        const bMatch =
+          b.intent_score > 0
+            ? 1
+            : 0;
+
+
+        if (
+          bMatch !== aMatch
+        ) {
+          return (
+            bMatch -
+            aMatch
+          );
+        }
+
+
+        if (
+          b.intent_score !==
+          a.intent_score
+        ) {
+          return (
+            b.intent_score -
+            a.intent_score
+          );
+        }
+
+
+        return (
+          b.score -
+          a.score
+        );
+      }
+    )
+    .slice(
+      0,
+      n
+    );
+}
+
+
+/* ============================================================
+   RETRIEVE FROM ANCHORS
+
+   Exact conceptual port of retrieve_from_anchors().
+   ============================================================ */
+
+export async function retrieveFromAnchors(
   input: GraphRetrievalInput
-): Promise<GraphCandidate[]> {
+): Promise<GraphResult[]> {
 
   if (
     !input.anchors ||
@@ -686,107 +932,85 @@ export async function retrieveGraph(
 
 
   const nPerAnchor =
-    normalizeNPerAnchor(
-      input.nPerAnchor
+    input.nPerAnchor ??
+    ethosConfig.graphResultsPerAnchor;
+
+
+  if (
+    !Number.isInteger(
+      nPerAnchor
+    ) ||
+    nPerAnchor < 1
+  ) {
+    throw new Error(
+      "graphResultsPerAnchor must be a positive integer."
+    );
+  }
+
+
+  const {
+    edges,
+    nodes
+  } =
+    await loadGraphData();
+
+
+  const adjacency =
+    buildAdjacency(
+      edges
     );
 
 
-  /* ----------------------------------------------------------
-     EXPAND ALL SEMANTIC ANCHORS
-     ---------------------------------------------------------- */
-
-  const expanded =
-    await Promise.all(
-      input.anchors.map(
-        anchor =>
-          expandAnchor(
-            anchor,
-            input.grade,
-            input.month,
-            nPerAnchor
-          )
-      )
-    );
+  const allResults:
+    GraphResult[] = [];
 
 
-  const contributions =
-    expanded.flat();
+  for (
+    let i = 0;
+    i < input.anchors.length;
+    i += 1
+  ) {
+
+    const anchor =
+      input.anchors[i];
 
 
-  /* ----------------------------------------------------------
-     AGGREGATE CANDIDATES
-     ---------------------------------------------------------- */
-
-  const candidates =
-    aggregateContributions(
-      contributions
-    );
-
-
-  /* ----------------------------------------------------------
-     STABLE PRELIMINARY ORDER
-
-     Again: this is not the validated hybrid score.
-
-     This simply makes graph output deterministic and useful
-     for debugging before hybrid scoring.
-     ---------------------------------------------------------- */
-
-  return candidates.sort(
-    (a, b) => {
-
-      if (
-        b.anchor_hits !==
-        a.anchor_hits
-      ) {
-        return (
-          b.anchor_hits -
-          a.anchor_hits
-        );
-      }
-
-
-      if (
-        b.max_alignment_strength !==
-        a.max_alignment_strength
-      ) {
-        return (
-          b.max_alignment_strength -
-          a.max_alignment_strength
-        );
-      }
-
-
-      if (
-        a.best_anchor_rank !==
-        b.best_anchor_rank
-      ) {
-        return (
-          a.best_anchor_rank -
-          b.best_anchor_rank
-        );
-      }
-
-
-      if (
-        b.max_anchor_semantic !==
-        a.max_anchor_semantic
-      ) {
-        return (
-          b.max_anchor_semantic -
-          a.max_anchor_semantic
-        );
-      }
-
-
-      return (
-        a.candidate.localeCompare(
-          b.candidate
-        )
+    const graphResults =
+      retrieveByIntent(
+        anchor.node_id,
+        input.intent,
+        nPerAnchor,
+        adjacency,
+        nodes
       );
+
+
+    for (
+      const result of graphResults
+    ) {
+
+      allResults.push({
+        ...result,
+
+        anchor_node:
+          anchor.node_id,
+
+        anchor_rank:
+          i + 1,
+
+        anchor_semantic_score:
+          anchor.similarity
+      });
     }
-  );
+  }
+
+
+  return allResults;
 }
 
 
-export default retrieveGraph;
+/* ============================================================
+   DEFAULT EXPORT
+   ============================================================ */
+
+export default retrieveFromAnchors;
