@@ -147,7 +147,7 @@ function scoreAuthority(
    Exact port of score_intent_match()
    ============================================================ */
 
-function scoreIntentMatch(
+export function scoreIntentMatch(
   intent: EthosIntent,
   nodeType: string,
   instructionalUse: string[]
