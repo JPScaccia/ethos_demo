@@ -1,0 +1,17 @@
+# Ethos Developer Handoff
+
+## Purpose
+
+This document identifies the exact current state of the Ethos production migration and the next actions required to continue development.
+
+Ethos was originally validated in R and is now being migrated into a TypeScript/PostgreSQL architecture for integration into Catholic Text.
+
+The current production retrieval baseline is:
+
+```text
+Ethos Retrieval v2.7a
+Embedding model: text-embedding-3-small
+Semantic seed K: 5
+Graph results per anchor: 20
+Context boost: 0.045
+Context policy: context_v0.1
