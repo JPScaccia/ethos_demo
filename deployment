@@ -1,0 +1,885 @@
+# deployment stuff
+
+  # Ethos Database Handoff & Retrieval Validation Test Plan
+
+**System:** Ethos / Catholic Text
+**Production retrieval baseline:** v2.7a
+**Handoff to:** Megham
+**Purpose:** Complete the database-dependent portion of the Ethos implementation and verify that the TypeScript production implementation reproduces the validated R retrieval system.
+
+
+## 1. Purpose of This Document
+
+Ethos has been implemented far enough for the TypeScript retrieval test suite to execute and reach the PostgreSQL database layer.
+Jonathan does not have access to the Catholic Text production/development database. Therefore, database connection, schema initialization, data import, and final retrieval-parity testing must be completed by Megham or someone with database access.
+This document defines those remaining tasks as a series of tests.
+The rule for this handoff is:
+**Do not modify or optimize the retrieval algorithm to make tests pass until the database has been correctly configured, seeded, and verified.**
+The initial objective is behavioral parity with the validated R implementation.
+
+
+##################################################################
+# TEST 0 — Confirm the Current Handoff State
+
+##Purpose
+Confirm that the application has reached the expected stopping point before making database changes.
+## Current state
+
+The retrieval test suite is: tests/retrieval.test.ts
+
+The frozen R comparison fixture is: tests/fixtures/retrieval-parity.json
+
+The latest test execution successfully discovered: 45 tests
+
+Two configuration/fixture tests passed.
+
+The remaining tests stopped when Prisma attempted to connect to PostgreSQL.
+
+The current error is: Can't reach database server at HOST
+
+This is expected because the local `.env` contains a placeholder database connection similar to: DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DATABASE"
+
+## PASS condition
+The repository reaches the database connection attempt without:
+
+* missing OpenAI credentials;
+* missing npm packages;
+* Prisma generation errors;
+* Prisma adapter errors;
+* `db.sql` errors;
+* test-discovery errors.
+
+Current status
+
+PASS — application-side initialization has reached the database boundary.**
+
+
+###################################################
+# TEST 1 — Replace the Placeholder Database Connection
+
+Purpose
+
+Connect Ethos to the PostgreSQL database that will be used by Catholic Text.
+
+## What Megham needs to change
+
+Locate the deployment environment variable:
+
+env
+DATABASE_URL
+
+The development repository may currently contain: 
+
+env
+DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DATABASE"
+
+Replace this with the actual PostgreSQL connection string.
+
+Conceptually:
+
+text
+USER       → actual PostgreSQL username
+PASSWORD   → actual PostgreSQL password
+HOST       → actual PostgreSQL hostname
+5432       → actual port
+DATABASE   → actual database name
+
+The resulting value will resemble:
+
+env
+DATABASE_URL="postgresql://actual_user:actual_password@actual_host:5432/actual_database"
+
+Do not commit the real connection string to GitHub.
+
+If Catholic Text already exposes `DATABASE_URL` through its deployment environment, Ethos should use the existing environment variable rather than hard-coding another database connection.
+
+## Important Prisma 7 configuration
+
+The repository uses:
+
+text
+prisma.config.ts
+
+to supply the database URL:
+
+ts
+import "dotenv/config";
+import { defineConfig, env } from "prisma/config";
+
+export default defineConfig({
+  schema: "prisma/schema.prisma",
+  migrations: {
+    path: "prisma/migrations"
+  },
+  datasource: {
+    url: env("DATABASE_URL")
+  }
+});
+
+
+The Prisma schema should remain:
+
+prisma
+datasource db {
+  provider = "postgresql"
+}
+
+
+Do **not** move:
+
+prisma
+url = env("DATABASE_URL")
+
+back into `schema.prisma`. This project is configured for Prisma 7.
+
+## PASS condition
+
+A Prisma/database query reaches the actual PostgreSQL server rather than returning:
+
+text
+Can't reach database server at HOST
+
+############################################
+  # TEST 2 — Verify the Prisma PostgreSQL Adapter
+
+## Purpose
+
+Confirm that Prisma 7 connects through the required PostgreSQL driver adapter.
+
+## Required packages
+
+The project should contain:
+
+text
+prisma
+@prisma/client
+@prisma/adapter-pg
+pg
+
+
+The current Prisma version used during development is:
+
+text
+7.10.0
+
+
+## Shared database client
+
+Database access should go through:
+
+text
+lib/db.ts
+
+
+The relevant implementation should use:
+
+ts
+import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+
+const adapter = new PrismaPg({
+  connectionString: process.env.DATABASE_URL!,
+});
+
+export const db = new PrismaClient({
+  adapter
+});
+
+
+The actual implementation may additionally contain singleton handling and logging configuration.
+
+## Important architectural rule
+
+Individual Ethos modules should use the shared database client.
+
+For example:
+
+ts
+import { db } from "../db";
+
+
+They should **not** independently do this:
+
+ts
+const prisma = new PrismaClient();
+
+
+Prisma 7 requires the PostgreSQL adapter.
+
+## PASS condition
+
+The application can instantiate Prisma and communicate with PostgreSQL without:
+
+text
+PrismaClient was instantiated without any options.
+A driver adapter is required.
+
+
+#############################################################
+# TEST 3 — Generate the Prisma Client
+
+Run:
+
+bash
+npx prisma generate
+
+
+Expected result:
+
+text
+Generated Prisma Client
+
+
+This command has already succeeded during development with Prisma 7.10.0, but it should be rerun in the target environment after dependencies and environment configuration are established.
+
+## PASS condition
+
+Prisma Client generates successfully with no schema validation errors.
+
+#####################################################################
+# TEST 4 — Verify pgvector Support
+
+## Purpose
+
+Ethos uses PostgreSQL to store and compare 1,536-dimensional OpenAI embeddings.
+
+The target PostgreSQL environment must support `pgvector`.
+
+Run:
+
+sql
+SELECT extname
+FROM pg_extension
+WHERE extname = 'vector';
+
+
+## PASS condition
+
+The query returns:
+
+text
+vector
+
+
+If it does not, enable the extension:
+
+sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+
+Then rerun the verification query.
+
+## Critical requirement
+
+Ethos uses:
+
+text
+text-embedding-3-small
+
+
+with:
+
+text
+1536 dimensions
+
+
+The Prisma representation is:
+
+prisma
+Unsupported("vector(1536)")
+
+
+If the current Catholic Text database provider does not support pgvector, Ethos will require either:
+
+* pgvector to be enabled on that PostgreSQL environment, or
+* a PostgreSQL environment that supports pgvector.
+
+Do **not** substitute another vector database or embedding implementation during this handoff. That would change the architecture being tested for parity.
+
+###################################################################
+
+# TEST 5 — Create the Ethos Database Schema
+
+## Purpose
+
+Create the database structures required by Ethos.
+
+The authoritative Prisma schema is:
+
+text
+prisma/schema.prisma
+
+
+The Ethos models include:
+
+text
+Node
+Edge
+Embedding
+AppConfig
+QueryLog
+QaLog
+Feedback
+
+
+The initial database setup/migration must ensure that:
+
+sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+
+occurs before creation of the vector-dependent embedding structure.
+
+## Integration note
+
+If Catholic Text already manages database migrations, integrate the Ethos migration into the existing Catholic Text migration workflow.
+
+Do not independently alter Catholic Text's existing tables.
+
+Ethos should add the required Ethos structures to the existing application architecture.
+
+## Important warning
+
+Some retrieval operations use raw SQL for vector similarity.
+
+Therefore, do not casually rename the underlying Ethos tables or database columns.
+
+If names are changed, the corresponding raw SQL in the retrieval modules must also be updated.
+
+## PASS condition
+
+All Ethos database tables can be queried successfully.
+
+###################################################################
+# TEST 6 — Import the Frozen Ethos Knowledge Base
+
+## Purpose
+
+Load the exact data used by the validated Grade 8 reference implementation.
+
+The repository contains:
+
+text
+data/nodes.json
+data/edges.json
+data/embeddings.json
+
+
+Expected counts are:
+
+text
+Nodes:       375
+Edges:       1,476
+Embeddings:  375
+
+
+Each embedding must contain:
+
+text
+1536 numeric dimensions
+
+
+The embeddings were generated using:
+
+text
+text-embedding-3-small
+
+
+## Important
+
+The embedding rows correspond to the exported node/anchor ordering.
+
+Preserve that node-to-vector mapping during import.
+
+Do **not** regenerate the stored knowledge-base embeddings during the initial deployment.
+
+They are part of the frozen retrieval reference system.
+
+The seed/import implementation is located in:
+
+text
+prisma/seed.ts
+
+
+and/or the repository's import script:
+
+text
+scripts/importEthosData.ts
+
+
+Use the final available import path appropriate to the Catholic Text environment.
+
+## PASS condition
+
+PostgreSQL contains exactly:
+
+text
+375 nodes
+1,476 edges
+375 embeddings
+
+
+#######################################################################
+
+# TEST 7 — Verify the Imported Knowledge Base
+
+Run:
+
+bash
+npx tsx scripts/verifyEthosData.ts
+
+
+The verification should establish:
+
+text
+Nodes:       375
+Edges:       1,476
+Embeddings:  375
+
+
+It should also verify:
+
+* all edge endpoints refer to valid nodes;
+* there are no orphan edges;
+* embedded nodes exist;
+* all vectors have 1,536 dimensions;
+* the expected embedding model is `text-embedding-3-small`;
+* there are no duplicate node IDs;
+* there are no duplicate edge IDs.
+
+## STOP condition
+
+If this test fails, **do not run retrieval-parity testing yet.**
+
+Fix the database/import problem first.
+
+## PASS condition
+
+The frozen knowledge base is reproduced exactly in PostgreSQL.
+
+###############################################################################
+
+# TEST 8 — Verify OpenAI Configuration
+
+Ethos expects:
+
+env
+OPENAI_API_KEY=" [ my key ]
+
+
+This must be supplied as a deployment secret/environment variable.
+
+Never commit the API key to source control.
+
+The validated embedding model is:
+
+text
+text-embedding-3-small
+
+
+Do not change this model during initial parity validation.
+
+Ethos ultimately uses OpenAI for:
+
+* query embeddings;
+* intent classification;
+* answer synthesis;
+* grounding QA;
+* proposition-level claim auditing;
+* repair when required.
+
+For the current retrieval-parity test, query embedding functionality is the important dependency.
+
+## PASS condition
+
+Ethos can obtain a valid 1,536-dimensional query embedding without a credentials error.
+
+#############################################################
+
+# TEST 9 — Run the Frozen Retrieval-Parity Suite
+
+Once Tests 1–8 pass, run:
+
+bash
+npx vitest run tests/retrieval.test.ts
+
+
+This is the most important handoff test.
+
+The fixture is:
+
+text
+tests/fixtures/retrieval-parity.json
+
+
+It contains results exported directly from the validated R v2.7a implementation.
+
+The 10 golden cases are:
+
+text
+Q16
+Q02
+Q04
+Q03
+U10
+U14
+S18
+U22
+JQ21
+NQ17
+
+
+Together they test the major retrieval behaviors, including:
+
+text
+general
+doctrine
+scripture
+saint
+virtue
+standards
+activity
+discussion
+family
+teacher preparation
+
+
+The suite checks:
+
+* candidate ordering;
+* candidate counts;
+* graph scores;
+* anchor metrics;
+* semantic scores;
+* hybrid scores;
+* month/context behavior.
+
+## PASS condition
+
+Expected final result:
+
+text
+Test Files  1 passed
+Tests       45 passed
+
+
+The exact formatting may vary by Vitest version.
+
+The important requirement is:
+
+text
+45 passed
+0 failed
+
+
+################################################################################
+
+# TEST 10 — Diagnose Actual Parity Failures
+
+This is the point at which a failed test becomes meaningful evidence about the TypeScript retrieval implementation.
+
+Before Tests 1–8 pass, a retrieval test failure may simply reflect infrastructure.
+
+After the database is correctly seeded, failures should be investigated as parity differences.
+
+Do **not** simply adjust expected values in:
+
+text
+tests/fixtures/retrieval-parity.json
+
+
+The fixture represents the frozen R reference.
+
+Likewise, do not tune the TypeScript implementation merely to improve the benchmark.
+
+Instead determine why the TypeScript implementation differs from R.
+
+Known areas that may require close attention include:
+
+### Semantic tie ordering
+
+R's semantic retrieval preserves the original `anchor_nodes` ordering when semantic scores tie.
+
+A SQL secondary sort such as:
+
+sql
+ORDER BY similarity DESC, node_id
+
+
+may therefore behave differently.
+
+If candidate scores tie, compare ordering against the original exported anchor ordering.
+
+### October virtue context
+
+The R implementation finds the **first** matching `curriculum_unit` for the month.
+
+For example, its behavior is effectively:
+
+text
+filter curriculum_unit to October
+→ take first row in anchor_nodes_data order
+
+
+A Prisma `findFirst()` without explicit ordering does not guarantee the same ordering.
+
+If `U10` fails while most other cases pass, investigate this first.
+
+### Floating-point differences
+
+The test suite uses numeric tolerance rather than requiring identical binary floating-point representation.
+
+Small machine-level differences are acceptable.
+
+Meaningful score differences are not.
+
+### Graph directionality
+
+The validated R graph traversal treats edges bidirectionally during retrieval.
+
+Do not accidentally restrict traversal to the stored `from_node → to_node` direction.
+
+### Duplicate two-hop paths
+
+The R implementation preserves legitimate many-to-many two-hop paths when computing graph metrics.
+
+Do not deduplicate these paths unless the R implementation does.
+
+##################################################################################
+
+# TEST 11 — Freeze Retrieval v2.7a
+
+Once:
+
+bash
+npx vitest run tests/retrieval.test.ts
+
+
+returns:
+
+text
+45 passed
+0 failed
+
+
+the TypeScript retrieval implementation should be considered the production-equivalent implementation of Ethos v2.7a.
+
+The frozen configuration is:
+
+text
+Retrieval version:          v2.7a
+Embedding model:            text-embedding-3-small
+Semantic seed K:            5
+Graph results per anchor:   20
+Context boost:              0.045
+Context policy:             context_v0.1
+
+
+At that point:
+
+> **Do not modify retrieval behavior without retaining these tests as regression tests.**
+
+Performance optimizations are fine after parity, provided the same tests continue to pass.
+
+####################################################################################
+
+# TEST 12 — Proceed to the Answer Pipeline
+
+Only after retrieval parity is green should implementation continue into the complete Ethos pipeline:
+
+text
+Teacher query
+      ↓
+Intent classification
+      ↓
+Semantic retrieval
+      ↓
+Graph expansion
+      ↓
+Hybrid ranking
+      ↓
+Evidence package
+      ↓
+Grounded synthesis
+      ↓
+Broad grounding QA
+      ↓
+Atomic claim audit
+      ↓
+Repair if required
+      ↓
+Re-audit
+      ↓
+Clean teacher answer
+      ↓
+Sources
+
+
+The central production function is intended to remain:
+
+ts
+runEthosQuery({
+  query,
+  grade: 8,
+  month: null,
+  intent: null
+})
+
+
+with a response shaped approximately as:
+
+ts
+{
+  query,
+  grade,
+  month,
+  intent,
+  intentConfidence,
+  answer,
+  sources,
+  safeToDisplay,
+  qa
+}
+
+
+############################################################################################
+# TEST 13 — Verify Catholic Text Integration
+
+Ethos is **not intended to become a separate standalone application**.
+
+The intended architecture is for Ethos to operate within Catholic Text, for example:
+
+text
+catholictext.org/ethos
+
+
+Catholic Text should continue to own its existing:
+
+* authentication;
+* accounts;
+* navigation;
+* site layout;
+* hosting;
+* analytics;
+* access/billing logic;
+* application-wide configuration.
+
+Ethos supplies the instructional reasoning and retrieval system.
+
+## PASS condition
+
+An authenticated Catholic Text user can access the Ethos interface using the existing application's infrastructure without maintaining a separate Ethos account or application.
+
+################################################################################
+
+# TEST 14 — Verify Teacher-Facing Safety Boundary
+
+Internal retrieval mechanics should remain server-side.
+
+The teacher should receive:
+
+text
+answer
+sources
+
+
+and appropriate interface information.
+
+The teacher should **not** see:
+
+text
+graph scores
+semantic scores
+hybrid scores
+candidate ranks
+anchor ranks
+internal evidence IDs such as E1/E2
+internal QA reasoning
+
+
+The governing rule for synthesis is:
+
+> **Ethos may synthesize, organize, and explain retrieved evidence, but it may not introduce Catholic claims, sources, saints, Scripture, standards, or resources that are absent from the evidence package.**
+
+The related atomic grounding rule is:
+
+> **Direct** — the evidence says it.
+> **Instructional synthesis** — Ethos transparently connects what the evidence says to what the teacher is teaching.
+> **Unsupported** — Ethos introduces something that neither the evidence nor a transparent instructional connection establishes.
+
+## PASS condition
+
+Internal retrieval/QA information remains internal, while the teacher receives a useful grounded instructional response with sources.
+
+###################################################################
+
+# Final Handoff Checklist
+
+Before Megham considers the database/retrieval handoff complete:
+
+text
+☐ Replace placeholder DATABASE_URL
+☐ Confirm PostgreSQL connection
+☐ Confirm Prisma 7 PostgreSQL adapter
+☐ Generate Prisma Client
+☐ Enable/verify pgvector
+☐ Create Ethos database structures
+☐ Import 375 nodes
+☐ Import 1,476 edges
+☐ Import 375 embeddings
+☐ Verify all embeddings are 1536 dimensions
+☐ Run verifyEthosData.ts successfully
+☐ Configure OPENAI_API_KEY
+☐ Run retrieval.test.ts
+☐ Achieve 45 passed / 0 failed
+☐ Investigate rather than overwrite any R/TypeScript parity differences
+☐ Freeze TypeScript retrieval as v2.7a
+☐ Continue to evidence/synthesis/QA implementation
+☐ Integrate Ethos into existing Catholic Text application
+
+
+## Current Exact Stopping Point
+
+At Jonathan's handoff, the application is currently here:
+
+text
+TypeScript retrieval code
+        ↓
+OpenAI query embedding
+        ↓
+Prisma raw SQL retrieval
+        ↓
+PostgreSQL connection attempt
+        ↓
+STOP
+
+
+The current stop is:
+
+text
+Can't reach database server at HOST
+
+
+because Jonathan does not have access to the actual Catholic Text PostgreSQL credentials.
+
+Therefore, **the first action for Megham is not to modify the retrieval code.**
+
+It is:
+
+text
+Replace DATABASE_URL
+        ↓
+Connect PostgreSQL
+        ↓
+Enable pgvector
+        ↓
+Create schema
+        ↓
+Import frozen data
+        ↓
+Verify 375 / 1,476 / 375
+        ↓
+Run the 45 retrieval-parity tests
+
+
+Only after that sequence will we know whether there are any remaining TypeScript-versus-R retrieval differences that need to be corrected.
